@@ -10,6 +10,9 @@ const PORT = process.env.PORT || 10000;
 app.get("/", (req, res) => {
   res.send("A-League backend running ✅");
 });
+app.get("/health", (req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
 
 app.get("/api/value", (req, res) => {
   res.json({
