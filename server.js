@@ -1,17 +1,20 @@
-// A-League backend v4 (FULL FILE)
+// A-League backend v5 (FULL FILE)
 // ✅ FixtureDownload schema support (DateUtc, HomeTeamScore, AwayTeamScore)
-// ✅ xG-style adjustment: shrink extreme scores (preprocess goals)
+// ✅ xG-style adjustment: shrink extreme scores (cap + shrink to league mean)
 // ✅ Home/Away split strengths: attH/defH + attA/defA
-// ✅ Totals calibration: Platt scaling for OU2.5 & OU3.5
+// ✅ Totals calibration: Platt scaling for OU2.5 & OU3.5 with guardrails
+// ✅ /api/diagnostics: season drift, base rates, top scorelines
+// ✅ /api/backtest: baselines + deltaLogloss + fixed-odds ROI sim
+// ✅ /api/backtest: mode=static or mode=walk (walk-forward expanding)
 // Endpoints:
 //  - /health
 //  - /api/seasons
 //  - /api/fixtures
 //  - /api/value
 //  - /api/teams
-//  - /api/backtest (season=auto)
+//  - /api/backtest
+//  - /api/diagnostics
 
-// ------------------- deps -------------------
 const express = require("express");
 const cors = require("cors");
 
@@ -21,7 +24,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// ------------------- config -------------------
+// ------------------- CONFIG -------------------
 const BRISBANE_TZ = "Australia/Brisbane";
 const COMMISSION = 0.05;
 const MAX_GOALS = 8;
@@ -41,16 +44,31 @@ const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;
 const HALF_LIFE_DAYS = 240;
 const MIN_GAMES_PER_TEAM = 6;
 
-// xG-style shrink knobs
-const GOAL_CAP = 6;        // cap extreme scores (winsorize)
-const SHRINK_ALPHA = 0.22; // 0=no shrink, 1=fully league mean
+// xG-style shrink knobs (less aggressive)
+const GOAL_CAP = 7;
+const SHRINK_ALPHA = 0.10;
 
-// ------------------- util -------------------
+// Regularization to prevent HA overfit
+const HA_L2 = 0.015;
+const HA_L2_HA = 0.01; // home-adv reg
+
+// Walk-forward rebuild frequency
+const WALK_REBUILD_EVERY = 6;
+
+// Platt calibration thresholds + guardrail
+const PLATT_MIN_SAMPLES = 60;
+const PLATT_IMPROVE_EPS = 0.002;
+
+// ------------------- UTIL -------------------
 function pick(obj, keys, fallback = null) {
   for (const k of keys) {
     if (obj && Object.prototype.hasOwnProperty.call(obj, k) && obj[k] != null && obj[k] !== "") return obj[k];
   }
   return fallback;
+}
+
+function clamp(x, lo, hi) {
+  return Math.max(lo, Math.min(hi, x));
 }
 
 function parseDateFlexible(v) {
@@ -90,10 +108,6 @@ function formatKickoffLocal(dateObj) {
   });
 }
 
-function clamp(x, lo, hi) {
-  return Math.max(lo, Math.min(hi, x));
-}
-
 function poissonP(k, lam) {
   let fact = 1;
   for (let i = 2; i <= k; i++) fact *= i;
@@ -119,7 +133,6 @@ function logit(p) {
   return Math.log(p / (1 - p));
 }
 
-// legacy string score parser (kept for compatibility)
 function parseScore(resultStr) {
   if (!resultStr) return null;
   const s = String(resultStr).trim();
@@ -129,7 +142,7 @@ function parseScore(resultStr) {
   return { hg: Number(m[1]), ag: Number(m[2]) };
 }
 
-// ------------------- fetch + cache -------------------
+// ------------------- FETCH + CACHE -------------------
 let feedCache = { byUrl: new Map() };
 let modelCache = { ts: 0, key: "", model: null };
 
@@ -142,7 +155,6 @@ async function loadFeed(url) {
   if (!r.ok) throw new Error(`feed fetch failed ${url} HTTP ${r.status}`);
   const json = await r.json();
   const rows = Array.isArray(json) ? json : (json?.data || json?.matches || json?.fixtures || []);
-
   feedCache.byUrl.set(url, { ts: now, data: rows });
   return rows;
 }
@@ -156,7 +168,7 @@ function rowToUnified(row, seasonLabel) {
   const rawDate = pick(row, ["DateUtc", "DateUTC", "Date", "date", "Kickoff", "kickoff", "Start", "start_time"], null);
   const dt = parseDateFlexible(rawDate);
 
-  // FixtureDownload score fields
+  // FixtureDownload scores
   const hs = pick(row, ["HomeTeamScore", "HomeScore", "homeScore", "home_score"], null);
   const as = pick(row, ["AwayTeamScore", "AwayScore", "awayScore", "away_score"], null);
 
@@ -165,7 +177,7 @@ function rowToUnified(row, seasonLabel) {
   if (!Number.isFinite(hg)) hg = null;
   if (!Number.isFinite(ag)) ag = null;
 
-  // fallback if some feed uses Result string
+  // fallback "Result" format
   if (hg == null || ag == null) {
     const res = parseScore(pick(row, ["Result", "result", "Score", "score"], null));
     if (res) { hg = res.hg; ag = res.ag; }
@@ -193,7 +205,7 @@ async function loadAllSeasonsUnified() {
   return all;
 }
 
-// ------------------- season helpers -------------------
+// ------------------- SEASON HELPERS -------------------
 function seasonCountsWithResults(all) {
   const counts = {};
   for (const m of all) {
@@ -222,13 +234,53 @@ function pickAutoBacktestSeason(counts) {
   return candidates[0].s;
 }
 
-// ------------------- xG-style adjustment (preprocess goals) -------------------
-function shrinkGoals(hg, ag, leagueAvgGoals) {
-  // leagueAvgGoals is per match (total goals)
-  // per-team mean ~ leagueAvgGoals/2
-  const muTeam = (leagueAvgGoals || 2.8) / 2;
+// ------------------- DIAGNOSTICS -------------------
+function summarizeSeason(matches) {
+  const played = matches.filter(m => m.kickoffISO && m.hg != null && m.ag != null);
+  const n = played.length;
+  if (!n) return null;
 
-  // cap extremes then shrink towards per-team mean
+  let totalGoals = 0;
+  let homeWins = 0, draws = 0, awayWins = 0;
+  let over25 = 0, over35 = 0;
+
+  const freq = {};
+  const cap = (x) => Math.max(0, Math.min(6, x));
+
+  for (const m of played) {
+    totalGoals += (m.hg + m.ag);
+
+    if (m.hg > m.ag) homeWins++;
+    else if (m.hg === m.ag) draws++;
+    else awayWins++;
+
+    const tg = m.hg + m.ag;
+    if (tg >= 3) over25++;
+    if (tg >= 4) over35++;
+
+    const k = `${cap(m.hg)}-${cap(m.ag)}`;
+    freq[k] = (freq[k] || 0) + 1;
+  }
+
+  const leagueAvgGoals = totalGoals / n;
+
+  const topScorelines = Object.entries(freq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([k, c]) => ({ score: k, count: c, pct: c / n }));
+
+  return {
+    played: n,
+    leagueAvgGoals,
+    oneXtwo: { homeWin: homeWins / n, draw: draws / n, awayWin: awayWins / n },
+    totals: { over25: over25 / n, over35: over35 / n },
+    topScorelines
+  };
+}
+
+// ------------------- xG-STYLE SCORE SHRINK -------------------
+function shrinkGoals(hg, ag, leagueAvgGoals) {
+  const muTeam = (leagueAvgGoals || 2.8) / 2;
   const cap = (g) => clamp(g, 0, GOAL_CAP);
 
   const hgC = cap(hg);
@@ -240,33 +292,27 @@ function shrinkGoals(hg, ag, leagueAvgGoals) {
   return { hgAdj, agAdj };
 }
 
-// ------------------- calibration (Platt scaling) -------------------
-// Fit a,b for: p_cal = sigmoid(a*logit(p_raw) + b)
-function fitPlatt(rawPs, ys, { iters = 500, lr = 0.02, l2 = 1e-3 } = {}) {
+// ------------------- CALIBRATION (PLATT) -------------------
+function fitPlatt(rawPs, ys, { iters = 350, lr = 0.02, l2 = 5e-3 } = {}) {
   let a = 1.0;
   let b = 0.0;
 
-  // gradient descent on logistic logloss
   for (let it = 0; it < iters; it++) {
     let ga = 0;
     let gb = 0;
+
     for (let i = 0; i < rawPs.length; i++) {
       const x = logit(rawPs[i]);
       const p = sigmoid(a * x + b);
       const y = ys[i];
-
-      // d/dz of logloss = (p - y)
       const dz = (p - y);
-
       ga += dz * x;
       gb += dz;
     }
 
-    // L2 regularization
     ga += l2 * a;
     gb += l2 * b;
 
-    // normalize
     ga /= rawPs.length;
     gb /= rawPs.length;
 
@@ -286,11 +332,65 @@ function applyPlatt(pRaw, cal) {
   return sigmoid(z);
 }
 
-// ------------------- model: home/away split strengths -------------------
+function loglossBinary(ps, ys) {
+  let s = 0;
+  for (let i = 0; i < ps.length; i++) {
+    const p = clamp(ps[i], 1e-12, 1 - 1e-12);
+    const y = ys[i];
+    s += -(y * Math.log(p) + (1 - y) * Math.log(1 - p));
+  }
+  return s / ps.length;
+}
+
+// ------------------- BASELINES + METRICS -------------------
+function baselineProbsFromSeasonStats(seasonStats) {
+  const homeWin = seasonStats?.oneXtwo?.homeWin ?? 0.40;
+  const draw = seasonStats?.oneXtwo?.draw ?? 0.27;
+  const awayWin = seasonStats?.oneXtwo?.awayWin ?? 0.33;
+
+  const leagueAvgGoals = seasonStats?.leagueAvgGoals ?? 2.8;
+  const muTeam = leagueAvgGoals / 2;
+
+  let pOver25 = 0, pOver35 = 0;
+  for (let hg = 0; hg <= MAX_GOALS; hg++) {
+    const ph = poissonP(hg, muTeam);
+    for (let ag = 0; ag <= MAX_GOALS; ag++) {
+      const pa = poissonP(ag, muTeam);
+      const p = ph * pa;
+      const tg = hg + ag;
+      if (tg >= 3) pOver25 += p;
+      if (tg >= 4) pOver35 += p;
+    }
+  }
+
+  return { p1x2: { H: homeWin, D: draw, A: awayWin }, pOver25, pOver35 };
+}
+
+function logloss1x2(p, yH, yD, yA) {
+  return -(yH * logSafe(p.H) + yD * logSafe(p.D) + yA * logSafe(p.A));
+}
+
+function loglossBinaryP(p, y) {
+  return -(y * logSafe(p) + (1 - y) * logSafe(1 - p));
+}
+
+// ------------------- FIXED-ODDS ROI SIM -------------------
+function fixedOddsPack() {
+  return {
+    oneXtwo: { H: 2.55, D: 3.40, A: 2.75 },
+    ou25_over: 1.90,
+    ou35_over: 2.40
+  };
+}
+
+function profit1uBinary(win, odds) {
+  if (odds == null) return 0;
+  return win ? (odds - 1) * (1 - COMMISSION) : -1;
+}
+
+// ------------------- MODEL (HOME/AWAY SPLIT) -------------------
 function buildModelFromMatches(matches, { halfLifeDays = HALF_LIFE_DAYS, minGamesPerTeam = MIN_GAMES_PER_TEAM } = {}) {
   const played = matches.filter(m => m.kickoffISO && m.hg != null && m.ag != null);
-
-  // Build team list
   const teamsSet = new Set();
   for (const m of played) { teamsSet.add(m.home); teamsSet.add(m.away); }
   const teams = [...teamsSet].sort();
@@ -298,9 +398,8 @@ function buildModelFromMatches(matches, { halfLifeDays = HALF_LIFE_DAYS, minGame
   const n = teams.length;
   if (n === 0) return null;
 
-  // League average goals
-  let totalGoals = 0;
-  let totalMatches = 0;
+  // League avg goals from raw scores (stable)
+  let totalGoals = 0, totalMatches = 0;
   for (const m of played) {
     totalGoals += (m.hg + m.ag);
     totalMatches += 1;
@@ -313,17 +412,15 @@ function buildModelFromMatches(matches, { halfLifeDays = HALF_LIFE_DAYS, minGame
     return { ...m, hgAdj, agAdj };
   });
 
-  // home/away split parameters
-  // For match H vs A:
-  //   muH = exp(ha + attH[H] + defA[A])
-  //   muA = exp(attA[A] + defH[H])
+  // Params:
+  // muH = exp(ha + attH[H] + defA[A])
+  // muA = exp(attA[A] + defH[H])
   let attH = new Array(n).fill(0);
   let defH = new Array(n).fill(0);
   let attA = new Array(n).fill(0);
   let defA = new Array(n).fill(0);
   let ha = 0.12;
 
-  // counts
   const gamesHome = new Array(n).fill(0);
   const gamesAway = new Array(n).fill(0);
   const gamesTotal = new Array(n).fill(0);
@@ -358,20 +455,26 @@ function buildModelFromMatches(matches, { halfLifeDays = HALF_LIFE_DAYS, minGame
       const muH = Math.exp(ha + attH[iH] + defA[iA]);
       const muA = Math.exp(attA[iA] + defH[iH]);
 
-      // use adjusted goals
       const eH = (m.hgAdj - muH) * w;
       const eA = (m.agAdj - muA) * w;
 
       gHa += eH;
 
-      // Home scoring depends on home attack + away defence
       gAttH[iH] += eH;
       gDefA[iA] += eH;
 
-      // Away scoring depends on away attack + home defence
       gAttA[iA] += eA;
       gDefH[iH] += eA;
     }
+
+    // L2 regularization to prevent overfit
+    for (let i = 0; i < n; i++) {
+      gAttH[i] -= HA_L2 * attH[i];
+      gDefH[i] -= HA_L2 * defH[i];
+      gAttA[i] -= HA_L2 * attA[i];
+      gDefA[i] -= HA_L2 * defA[i];
+    }
+    gHa -= HA_L2_HA * ha;
 
     for (let i = 0; i < n; i++) {
       attH[i] += lr * gAttH[i];
@@ -381,7 +484,7 @@ function buildModelFromMatches(matches, { halfLifeDays = HALF_LIFE_DAYS, minGame
     }
     ha += lr * gHa;
 
-    // identifiability: keep each param group zero-mean
+    // identifiability: zero-mean each group
     const mean = (arr) => arr.reduce((a, b) => a + b, 0) / n;
     const zmean = (arr) => {
       const m = mean(arr);
@@ -399,7 +502,6 @@ function buildModelFromMatches(matches, { halfLifeDays = HALF_LIFE_DAYS, minGame
     }
   }
 
-  // Build team meta
   const teamMeta = {};
   for (let i = 0; i < n; i++) {
     teamMeta[teams[i]] = {
@@ -420,20 +522,18 @@ function buildModelFromMatches(matches, { halfLifeDays = HALF_LIFE_DAYS, minGame
     halfLifeDays,
     minGamesPerTeam,
     teamMeta,
-    leagueAvgGoals
+    leagueAvgGoals,
+    calibration: null
   };
 }
 
-// Compute match probabilities (returns calibrated totals probabilities too)
 function matchProbs(model, home, away) {
   if (!model || !model.idx.has(home) || !model.idx.has(away)) {
     return {
       muH: 1.45, muA: 1.30,
       p1x2: { H: 0.40, D: 0.27, A: 0.33 },
-      pOver25_raw: 0.56,
-      pOver35_raw: 0.33,
-      pOver25: 0.56,
-      pOver35: 0.33,
+      pOver25_raw: 0.56, pOver35_raw: 0.33,
+      pOver25: 0.56, pOver35: 0.33,
       okSample: false
     };
   }
@@ -476,41 +576,70 @@ function matchProbs(model, home, away) {
   const pOver25_raw = pOver25;
   const pOver35_raw = pOver35;
 
-  // apply Platt calibration if present
   const pOver25_cal = model.calibration?.ou25 ? applyPlatt(pOver25_raw, model.calibration.ou25) : pOver25_raw;
   const pOver35_cal = model.calibration?.ou35 ? applyPlatt(pOver35_raw, model.calibration.ou35) : pOver35_raw;
 
   return {
     muH, muA,
     p1x2: { H: pH, D: pD, A: pA },
-    pOver25_raw,
-    pOver35_raw,
+    pOver25_raw, pOver35_raw,
     pOver25: pOver25_cal,
     pOver35: pOver35_cal,
     okSample
   };
 }
 
-// ------------------- synthetic odds -------------------
-function synthOdds1x2(pH, pD, pA, margin = 0.055) {
-  const sum = pH + pD + pA;
-  if (sum <= 0) return { H: null, D: null, A: null };
-  pH /= sum; pD /= sum; pA /= sum;
-  const qH = pH * (1 + margin), qD = pD * (1 + margin), qA = pA * (1 + margin);
-  return { H: 1 / qH, D: 1 / qD, A: 1 / qA };
+// ------------------- PLATT FIT ON A MODEL + DATA (GUARDED) -------------------
+function fitTotalsCalibrationForModel(model, trainMatchesPlayed) {
+  if (!model) return null;
+  const raw25 = [], y25 = [];
+  const raw35 = [], y35 = [];
+
+  for (const m of trainMatchesPlayed) {
+    const iH = model.idx.get(m.home);
+    const iA = model.idx.get(m.away);
+    if (iH == null || iA == null) continue;
+
+    const muH = Math.exp(model.ha + model.attH[iH] + model.defA[iA]);
+    const muA = Math.exp(model.attA[iA] + model.defH[iH]);
+
+    let pO25 = 0, pO35 = 0;
+    for (let hg = 0; hg <= MAX_GOALS; hg++) {
+      const ph = poissonP(hg, muH);
+      for (let ag = 0; ag <= MAX_GOALS; ag++) {
+        const pa = poissonP(ag, muA);
+        const p = ph * pa;
+        const tg = hg + ag;
+        if (tg >= 3) pO25 += p;
+        if (tg >= 4) pO35 += p;
+      }
+    }
+
+    const tgObs = m.hg + m.ag;
+    raw25.push(clamp(pO25, 1e-6, 1 - 1e-6)); y25.push(tgObs >= 3 ? 1 : 0);
+    raw35.push(clamp(pO35, 1e-6, 1 - 1e-6)); y35.push(tgObs >= 4 ? 1 : 0);
+  }
+
+  const cal = {};
+
+  if (raw25.length >= PLATT_MIN_SAMPLES) {
+    const fit = fitPlatt(raw25, y25, { iters: 350, lr: 0.02, l2: 5e-3 });
+    const rawLL = loglossBinary(raw25, y25);
+    const calLL = loglossBinary(raw25.map(p => applyPlatt(p, fit)), y25);
+    if (calLL + PLATT_IMPROVE_EPS < rawLL) cal.ou25 = fit;
+  }
+
+  if (raw35.length >= PLATT_MIN_SAMPLES) {
+    const fit = fitPlatt(raw35, y35, { iters: 350, lr: 0.02, l2: 5e-3 });
+    const rawLL = loglossBinary(raw35, y35);
+    const calLL = loglossBinary(raw35.map(p => applyPlatt(p, fit)), y35);
+    if (calLL + PLATT_IMPROVE_EPS < rawLL) cal.ou35 = fit;
+  }
+
+  return cal;
 }
 
-function synthOddsBinary(p, margin = 0.05) {
-  const q = clamp(p * (1 + margin), 0.02, 0.98);
-  return 1 / q;
-}
-
-function profit1uBinary(win, odds) {
-  if (odds == null) return 0;
-  return win ? (odds - 1) * (1 - COMMISSION) : -1;
-}
-
-// ------------------- model cache (with calibration) -------------------
+// ------------------- MODEL CACHE (STATIC MODEL) -------------------
 async function getModelFor(trainKey, filterFn) {
   const now = Date.now();
   if (modelCache.model && modelCache.key === trainKey && (now - modelCache.ts) < MODEL_CACHE_MS) {
@@ -527,49 +656,7 @@ async function getModelFor(trainKey, filterFn) {
     return null;
   }
 
-  // Fit Platt calibration on training data (for totals)
-  // We fit on raw totals probs produced by the model (before calibration)
-  const raw25 = [];
-  const y25 = [];
-  const raw35 = [];
-  const y35 = [];
-
-  for (const m of trainPlayed) {
-    const probs = (function rawOnly() {
-      const iH = model.idx.get(m.home);
-      const iA = model.idx.get(m.away);
-      if (iH == null || iA == null) return null;
-
-      const muH = Math.exp(model.ha + model.attH[iH] + model.defA[iA]);
-      const muA = Math.exp(model.attA[iA] + model.defH[iH]);
-
-      let pOver25 = 0, pOver35 = 0;
-      for (let hg = 0; hg <= MAX_GOALS; hg++) {
-        const ph = poissonP(hg, muH);
-        for (let ag = 0; ag <= MAX_GOALS; ag++) {
-          const pa = poissonP(ag, muA);
-          const p = ph * pa;
-          const tg = hg + ag;
-          if (tg >= 3) pOver25 += p;
-          if (tg >= 4) pOver35 += p;
-        }
-      }
-      // normalize by match mass (approx 1, but keep safe)
-      return { pOver25: clamp(pOver25, 1e-6, 1 - 1e-6), pOver35: clamp(pOver35, 1e-6, 1 - 1e-6) };
-    })();
-
-    if (!probs) continue;
-
-    const tg = m.hg + m.ag;
-    raw25.push(probs.pOver25); y25.push(tg >= 3 ? 1 : 0);
-    raw35.push(probs.pOver35); y35.push(tg >= 4 ? 1 : 0);
-  }
-
-  const cal = {};
-  if (raw25.length >= 30) cal.ou25 = fitPlatt(raw25, y25, { iters: 550, lr: 0.02, l2: 1e-3 });
-  if (raw35.length >= 30) cal.ou35 = fitPlatt(raw35, y35, { iters: 550, lr: 0.02, l2: 1e-3 });
-
-  model.calibration = cal;
+  model.calibration = fitTotalsCalibrationForModel(model, trainPlayed) || null;
 
   modelCache = { ts: now, key: trainKey, model };
   return model;
@@ -579,7 +666,7 @@ async function getDefaultModel() {
   return getModelFor("default_all", _ => true);
 }
 
-// ------------------- routes -------------------
+// ------------------- ROUTES -------------------
 app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.get("/api/seasons", async (req, res) => {
@@ -593,7 +680,20 @@ app.get("/api/seasons", async (req, res) => {
   }
 });
 
-// upcoming fixtures (latest season label in our config)
+app.get("/api/diagnostics", async (req, res) => {
+  try {
+    const all = await loadAllSeasonsUnified();
+    const bySeason = {};
+    for (const s of SEASON_FEEDS.map(x => x.season)) {
+      bySeason[s] = summarizeSeason(all.filter(m => m.season === s));
+    }
+    res.json({ seasons: bySeason });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+// upcoming fixtures (latest season label in config)
 app.get("/api/fixtures", async (req, res) => {
   try {
     const days = clamp(Number(req.query.days || 14), 1, 90);
@@ -618,7 +718,69 @@ app.get("/api/fixtures", async (req, res) => {
   }
 });
 
-// value endpoint used by UI (synthetic odds; totals are calibrated)
+// team stats (home/away splits)
+app.get("/api/teams", async (req, res) => {
+  try {
+    const model = await getDefaultModel();
+    if (!model) return res.json({ meta: {}, teams: [] });
+
+    const teams = model.teams.map(t => {
+      const tm = model.teamMeta[t] || {};
+      const attackHome = Math.exp(tm.attH ?? 0);
+      const defenceHome = Math.exp(-(tm.defH ?? 0));
+      const attackAway = Math.exp(tm.attA ?? 0);
+      const defenceAway = Math.exp(-(tm.defA ?? 0));
+
+      return {
+        team: t,
+        games: tm.games ?? 0,
+        homeGames: tm.homeGames ?? 0,
+        awayGames: tm.awayGames ?? 0,
+        attH: tm.attH ?? 0,
+        defH: tm.defH ?? 0,
+        attA: tm.attA ?? 0,
+        defA: tm.defA ?? 0,
+        attackHome,
+        defenceHome,
+        attackAway,
+        defenceAway
+      };
+    });
+
+    teams.sort((a, b) => {
+      const sa = (a.attackHome + a.defenceHome + a.attackAway + a.defenceAway);
+      const sb = (b.attackHome + b.defenceHome + b.attackAway + b.defenceAway);
+      return sb - sa;
+    });
+
+    res.json({
+      meta: {
+        model: `Poisson+TimeDecay+HA (HL ${model.halfLifeDays}d) + xG-shrink + Platt(guarded)`,
+        minGamesPerTeam: model.minGamesPerTeam,
+        leagueAvgGoals: model.leagueAvgGoals,
+        xgShrink: { alpha: SHRINK_ALPHA, goalCap: GOAL_CAP },
+        calibration: model.calibration || null
+      },
+      teams
+    });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+// value endpoint (synthetic odds remain fine for UI ranking; totals show raw->cal)
+function synthOdds1x2(pH, pD, pA, margin = 0.055) {
+  const sum = pH + pD + pA;
+  if (sum <= 0) return { H: null, D: null, A: null };
+  pH /= sum; pD /= sum; pA /= sum;
+  const qH = pH * (1 + margin), qD = pD * (1 + margin), qA = pA * (1 + margin);
+  return { H: 1 / qH, D: 1 / qD, A: 1 / qA };
+}
+function synthOddsBinary(p, margin = 0.05) {
+  const q = clamp(p * (1 + margin), 0.02, 0.98);
+  return 1 / q;
+}
+
 app.get("/api/value", async (req, res) => {
   try {
     const days = clamp(Number(req.query.days || 14), 1, 90);
@@ -643,10 +805,9 @@ app.get("/api/value", async (req, res) => {
 
     const ui = upcoming.map(m => {
       const probs = matchProbs(model, m.home, m.away);
-
       const p = probs.p1x2;
-      const odds1x2 = synthOdds1x2(p.H, p.D, p.A, 0.055);
 
+      const odds1x2 = synthOdds1x2(p.H, p.D, p.A, 0.055);
       const oddsOver25 = synthOddsBinary(probs.pOver25, 0.05);
       const oddsOver35 = synthOddsBinary(probs.pOver35, 0.05);
 
@@ -657,25 +818,11 @@ app.get("/api/value", async (req, res) => {
         kickoffISO: m.kickoffISO,
         home: m.home,
         away: m.away,
-        model: {
-          muH: probs.muH,
-          muA: probs.muA,
-          okSample: probs.okSample
-        },
+        model: { muH: probs.muH, muA: probs.muA, okSample: probs.okSample },
         markets: {
           "1x2": { probs: p, odds: odds1x2 },
-          "ou25": {
-            line: 2.5,
-            probOver_raw: probs.pOver25_raw,
-            probOver: probs.pOver25,
-            oddsOver: oddsOver25
-          },
-          "ou35": {
-            line: 3.5,
-            probOver_raw: probs.pOver35_raw,
-            probOver: probs.pOver35,
-            oddsOver: oddsOver35
-          }
+          "ou25": { line: 2.5, probOver_raw: probs.pOver25_raw, probOver: probs.pOver25, oddsOver: oddsOver25 },
+          "ou35": { line: 3.5, probOver_raw: probs.pOver35_raw, probOver: probs.pOver35, oddsOver: oddsOver35 }
         }
       };
     });
@@ -702,7 +849,7 @@ app.get("/api/value", async (req, res) => {
 
     res.json({
       meta: {
-        model: model ? `Poisson+TimeDecay+HA (HL ${model.halfLifeDays}d) + xG-shrink + Platt(OU)` : "neutral",
+        model: model ? `Poisson+TimeDecay+HA (HL ${model.halfLifeDays}d) + xG-shrink + Platt(guarded)` : "neutral",
         calibration: model?.calibration || null,
         leagueAvgGoals: model?.leagueAvgGoals || null,
         minGamesPerTeam: model?.minGamesPerTeam || 0,
@@ -715,67 +862,13 @@ app.get("/api/value", async (req, res) => {
   }
 });
 
-// team stats (HOME/AWAY splits)
-app.get("/api/teams", async (req, res) => {
-  try {
-    const model = await getDefaultModel();
-    if (!model) return res.json({ meta: {}, teams: [] });
-
-    const teams = model.teams.map(t => {
-      const tm = model.teamMeta[t] || {};
-      const attackHome = Math.exp(tm.attH ?? 0);
-      const defenceHome = Math.exp(-(tm.defH ?? 0));
-      const attackAway = Math.exp(tm.attA ?? 0);
-      const defenceAway = Math.exp(-(tm.defA ?? 0));
-
-      return {
-        team: t,
-        games: tm.games ?? 0,
-        homeGames: tm.homeGames ?? 0,
-        awayGames: tm.awayGames ?? 0,
-
-        // raw params
-        attH: tm.attH ?? 0,
-        defH: tm.defH ?? 0,
-        attA: tm.attA ?? 0,
-        defA: tm.defA ?? 0,
-
-        // readable ratings
-        attackHome,
-        defenceHome,
-        attackAway,
-        defenceAway
-      };
-    });
-
-    // sort by combined strength (home+away balance)
-    teams.sort((a, b) => {
-      const sa = (a.attackHome + a.defenceHome + a.attackAway + a.defenceAway);
-      const sb = (b.attackHome + b.defenceHome + b.attackAway + b.defenceAway);
-      return sb - sa;
-    });
-
-    res.json({
-      meta: {
-        model: `Poisson+TimeDecay+HA (HL ${model.halfLifeDays}d) + xG-shrink + Platt(OU)`,
-        minGamesPerTeam: model.minGamesPerTeam,
-        leagueAvgGoals: model.leagueAvgGoals,
-        xgShrink: { alpha: SHRINK_ALPHA, goalCap: GOAL_CAP },
-        calibration: model.calibration || null
-      },
-      teams
-    });
-  } catch (e) {
-    res.status(500).json({ error: e?.message || String(e) });
-  }
-});
-
-// backtest (calibration charts should now look better on totals)
+// backtest: mode=static|walk
 app.get("/api/backtest", async (req, res) => {
   try {
     let season = String(req.query.season || "auto");
     const minEv = clamp(Number(req.query.min_ev || 0.02), 0, 10);
     const minP = clamp(Number(req.query.min_p || 0.10), 0, 1);
+    const mode = String(req.query.mode || "static"); // static or walk
 
     const all = await loadAllSeasonsUnified();
     const counts = seasonCountsWithResults(all);
@@ -783,35 +876,39 @@ app.get("/api/backtest", async (req, res) => {
     if (season === "auto") {
       const auto = pickAutoBacktestSeason(counts);
       if (!auto) {
-        return res.json({
-          meta: { season: "auto", note: "No seasons with played matches were found in the feeds." },
-          seasons: counts,
-          summary: {},
-          calibration: {}
-        });
+        return res.json({ meta: { season: "auto", note: "No seasons with played matches were found in the feeds." }, seasons: counts, summary: {}, calibration: {} });
       }
       season = auto;
     }
 
     const test = all.filter(m => m.season === season && m.kickoffISO && m.hg != null && m.ag != null);
     if (test.length === 0) {
-      return res.json({
-        meta: { season, note: "No played matches found for that season." },
-        seasons: counts,
-        summary: {},
-        calibration: {}
-      });
+      return res.json({ meta: { season, note: "No played matches found for that season." }, seasons: counts, summary: {}, calibration: {} });
     }
 
-    // Train excluding test season (also fits Platt calibration on train set)
-    const trainKey = `train_excluding_${season}`;
-    const model = await getModelFor(trainKey, m => m.season !== season);
+    const seasonStats = summarizeSeason(all.filter(m => m.season === season));
+    const baseline = baselineProbsFromSeasonStats(seasonStats);
+
+    // Static model: trained on all seasons except test
+    const staticKey = `train_excluding_${season}`;
+    const staticModel = await getModelFor(staticKey, m => m.season !== season);
+
+    // Walk-forward state
+    let walkModel = staticModel;
+    const seen = []; // prior test matches
+
+    const testSorted = [...test].sort((a, b) => new Date(a.kickoffISO).getTime() - new Date(b.kickoffISO).getTime());
+    const oddsFixed = fixedOddsPack();
 
     // metrics
-    let brier1x2 = 0, logloss1x2 = 0, n1x2 = 0, accTop = 0;
-    let brier25 = 0, logloss25 = 0, n25 = 0;
-    let brier35 = 0, logloss35 = 0, n35 = 0;
+    let brier1x2 = 0, logloss1x2_sum = 0, n1x2 = 0, accTop = 0;
+    let brier25 = 0, logloss25_sum = 0, n25 = 0;
+    let brier35 = 0, logloss35_sum = 0, n35 = 0;
 
+    // baselines (logloss only)
+    let baseLL_1x2 = 0, baseLL_25 = 0, baseLL_35 = 0;
+
+    // ROI
     const roi = {
       oneXtwo: { bets: 0, wins: 0, profit: 0 },
       ou25: { bets: 0, wins: 0, profit: 0 },
@@ -836,8 +933,30 @@ app.get("/api/backtest", async (req, res) => {
       bins[b].ySum += y;
     }
 
-    for (const m of test) {
-      const probs = matchProbs(model, m.home, m.away);
+    function finalizeBins(bins) {
+      return bins.map(b => ({ bin: b.bin, n: b.n, pAvg: b.n ? b.pSum / b.n : null, yAvg: b.n ? b.ySum / b.n : null }));
+    }
+
+    for (let i = 0; i < testSorted.length; i++) {
+      const m = testSorted[i];
+
+      let modelToUse = staticModel;
+
+      if (mode === "walk") {
+        if (i > 0 && (i % WALK_REBUILD_EVERY === 0)) {
+          const allTrain = all.filter(x => x.season !== season).concat(seen);
+          const nextModel = buildModelFromMatches(allTrain, { halfLifeDays: HALF_LIFE_DAYS, minGamesPerTeam: MIN_GAMES_PER_TEAM });
+
+          if (nextModel) {
+            const trainPlayed = allTrain.filter(x => x.kickoffISO && x.hg != null && x.ag != null);
+            nextModel.calibration = fitTotalsCalibrationForModel(nextModel, trainPlayed) || null;
+          }
+          walkModel = nextModel || walkModel;
+        }
+        modelToUse = walkModel || staticModel;
+      }
+
+      const probs = matchProbs(modelToUse, m.home, m.away);
 
       // observed 1x2
       const yH = m.hg > m.ag ? 1 : 0;
@@ -847,7 +966,8 @@ app.get("/api/backtest", async (req, res) => {
       const p = probs.p1x2;
 
       brier1x2 += (p.H - yH) ** 2 + (p.D - yD) ** 2 + (p.A - yA) ** 2;
-      logloss1x2 += -(yH * logSafe(p.H) + yD * logSafe(p.D) + yA * logSafe(p.A));
+      const ll1 = -(yH * logSafe(p.H) + yD * logSafe(p.D) + yA * logSafe(p.A));
+      logloss1x2_sum += ll1;
       n1x2 += 1;
 
       const top = [{ k: "H", v: p.H }, { k: "D", v: p.D }, { k: "A", v: p.A }].sort((a, b) => b.v - a.v)[0];
@@ -860,62 +980,59 @@ app.get("/api/backtest", async (req, res) => {
       const y25 = tg >= 3 ? 1 : 0;
       const y35 = tg >= 4 ? 1 : 0;
 
-      // raw & calibrated totals
       addCal(calBins.ou25_raw, probs.pOver25_raw, y25);
       addCal(calBins.ou25_cal, probs.pOver25, y25);
       addCal(calBins.ou35_raw, probs.pOver35_raw, y35);
       addCal(calBins.ou35_cal, probs.pOver35, y35);
 
       brier25 += (probs.pOver25 - y25) ** 2;
-      logloss25 += -(y25 * logSafe(probs.pOver25) + (1 - y25) * logSafe(1 - probs.pOver25));
+      logloss25_sum += -(y25 * logSafe(probs.pOver25) + (1 - y25) * logSafe(1 - probs.pOver25));
       n25 += 1;
 
       brier35 += (probs.pOver35 - y35) ** 2;
-      logloss35 += -(y35 * logSafe(probs.pOver35) + (1 - y35) * logSafe(1 - probs.pOver35));
+      logloss35_sum += -(y35 * logSafe(probs.pOver35) + (1 - y35) * logSafe(1 - probs.pOver35));
       n35 += 1;
 
-      // ROI simulation (synthetic)
-      const odds1x2 = synthOdds1x2(p.H, p.D, p.A, 0.055);
-      const oddsO25 = synthOddsBinary(probs.pOver25, 0.05);
-      const oddsO35 = synthOddsBinary(probs.pOver35, 0.05);
+      // baseline logloss accumulation
+      baseLL_1x2 += logloss1x2(baseline.p1x2, yH, yD, yA);
+      baseLL_25 += loglossBinaryP(baseline.pOver25, y25);
+      baseLL_35 += loglossBinaryP(baseline.pOver35, y35);
+
+      // ROI sim using FIXED odds (so bets exist)
+      const odds1x2 = oddsFixed.oneXtwo;
+      const oddsO25 = oddsFixed.ou25_over;
+      const oddsO35 = oddsFixed.ou35_over;
 
       // 1x2: bet top pick if EV passes
       const topOdds = top.k === "H" ? odds1x2.H : top.k === "D" ? odds1x2.D : odds1x2.A;
       const topP = top.v;
       const topEV = topP * (topOdds - 1) * (1 - COMMISSION) - (1 - topP);
-      if (topOdds != null && topP >= minP && topEV >= minEv) {
+      if (topP >= minP && topEV >= minEv) {
         roi.oneXtwo.bets++; roi.combined.bets++;
         if (topY === 1) { roi.oneXtwo.wins++; roi.combined.wins++; }
         const pr = profit1uBinary(topY === 1, topOdds);
         roi.oneXtwo.profit += pr; roi.combined.profit += pr;
       }
 
-      // OU2.5
+      // OU2.5 Over
       const ev25 = probs.pOver25 * (oddsO25 - 1) * (1 - COMMISSION) - (1 - probs.pOver25);
-      if (oddsO25 != null && probs.pOver25 >= minP && ev25 >= minEv) {
+      if (probs.pOver25 >= minP && ev25 >= minEv) {
         roi.ou25.bets++; roi.combined.bets++;
         if (y25 === 1) { roi.ou25.wins++; roi.combined.wins++; }
         const pr = profit1uBinary(y25 === 1, oddsO25);
         roi.ou25.profit += pr; roi.combined.profit += pr;
       }
 
-      // OU3.5
+      // OU3.5 Over
       const ev35 = probs.pOver35 * (oddsO35 - 1) * (1 - COMMISSION) - (1 - probs.pOver35);
-      if (oddsO35 != null && probs.pOver35 >= minP && ev35 >= minEv) {
+      if (probs.pOver35 >= minP && ev35 >= minEv) {
         roi.ou35.bets++; roi.combined.bets++;
         if (y35 === 1) { roi.ou35.wins++; roi.combined.wins++; }
         const pr = profit1uBinary(y35 === 1, oddsO35);
         roi.ou35.profit += pr; roi.combined.profit += pr;
       }
-    }
 
-    function finalizeBins(bins) {
-      return bins.map(b => ({
-        bin: b.bin,
-        n: b.n,
-        pAvg: b.n ? b.pSum / b.n : null,
-        yAvg: b.n ? b.ySum / b.n : null
-      }));
+      if (mode === "walk") seen.push(m);
     }
 
     const fmtRoi = (x) => ({
@@ -924,34 +1041,48 @@ app.get("/api/backtest", async (req, res) => {
       winRate: x.bets ? x.wins / x.bets : null
     });
 
+    const modelText = `Poisson+TimeDecay+HA (HL ${HALF_LIFE_DAYS}d) + xG-shrink + Platt(guarded)`;
+
     res.json({
       meta: {
         season,
+        mode,
         trainedOn: SEASON_FEEDS.map(x => x.season).filter(s => s !== season),
-        model: model ? `Poisson+TimeDecay+HA (HL ${model.halfLifeDays}d) + xG-shrink + Platt(OU)` : "neutral",
+        model: modelText,
         thresholds: { minEv, minP },
         xgShrink: { alpha: SHRINK_ALPHA, goalCap: GOAL_CAP },
-        calibration: model?.calibration || null
+        roiSim: { type: "fixed_odds", odds: oddsFixed },
+        calibration_static: staticModel?.calibration || null
       },
       summary: {
-        matches: test.length,
+        matches: testSorted.length,
         oneXtwo: {
           topPickAcc: n1x2 ? accTop / n1x2 : null,
           brier: n1x2 ? brier1x2 / n1x2 : null,
-          logloss: n1x2 ? logloss1x2 / n1x2 : null,
+          logloss: n1x2 ? logloss1x2_sum / n1x2 : null,
           roi: fmtRoi(roi.oneXtwo)
         },
         ou25: {
           brier: n25 ? brier25 / n25 : null,
-          logloss: n25 ? logloss25 / n25 : null,
+          logloss: n25 ? logloss25_sum / n25 : null,
           roi: fmtRoi(roi.ou25)
         },
         ou35: {
           brier: n35 ? brier35 / n35 : null,
-          logloss: n35 ? logloss35 / n35 : null,
+          logloss: n35 ? logloss35_sum / n35 : null,
           roi: fmtRoi(roi.ou35)
         },
-        combined: fmtRoi(roi.combined)
+        combined: fmtRoi(roi.combined),
+        baseline: {
+          oneXtwo_logloss: baseLL_1x2 / testSorted.length,
+          ou25_logloss: baseLL_25 / testSorted.length,
+          ou35_logloss: baseLL_35 / testSorted.length
+        },
+        deltaLogloss: {
+          oneXtwo: (logloss1x2_sum / n1x2) - (baseLL_1x2 / testSorted.length),
+          ou25: (logloss25_sum / n25) - (baseLL_25 / testSorted.length),
+          ou35: (logloss35_sum / n35) - (baseLL_35 / testSorted.length)
+        }
       },
       calibration: {
         oneXtwoTop: finalizeBins(calBins.oneXtwoTop),
