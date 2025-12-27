@@ -1,17 +1,14 @@
-// A-League backend (fixtures + results + simple goals model + synthetic odds)
-// Deploy on Render. No Betfair needed yet.
+// A-League backend v3
+// Adds:
+//  - /api/teams   (attack/defence ratings + games played)
+//  - /api/backtest (last season backtest: ROI, hit rate, calibration, brier/logloss)
 //
-// Data source: FixtureDownload JSON feeds (updated ~daily; schema can change).
-// See: https://fixturedownload.com/ (export -> JSON feed)
+// Still supports:
+//  - /health
+//  - /api/fixtures
+//  - /api/value
 //
-// Endpoints:
-//   GET /health
-//   GET /api/fixtures?days=14&limit=20
-//   GET /api/value?days=14&limit=20&odds=synthetic&min_sample=1&min_ev=0.02&min_p=0.10
-//
-// Notes:
-// - odds=synthetic gives "book-like" odds so you can test EV workflow now.
-// - odds=live is a placeholder (Betfair later).
+// No Betfair required (synthetic odds).
 
 const express = require("express");
 const cors = require("cors");
@@ -24,10 +21,9 @@ const PORT = process.env.PORT || 10000;
 
 // ------------ CONFIG ------------
 const BRISBANE_TZ = "Australia/Brisbane";
-const COMMISSION = 0.05; // used client-side too
-const MAX_GOALS = 8; // scoreline grid cap for probabilities
+const COMMISSION = 0.05;
+const MAX_GOALS = 8;
 
-// Seasons to use for training (results included in feeds)
 const SEASON_FEEDS = [
   { season: "2022/23", url: "https://fixturedownload.com/feed/json/aleague-2022" },
   { season: "2023/24", url: "https://fixturedownload.com/feed/json/aleague-men-2023" },
@@ -35,9 +31,8 @@ const SEASON_FEEDS = [
   { season: "2025/26", url: "https://fixturedownload.com/feed/json/aleague-men-2025" }
 ];
 
-// Cache intervals
-const FIXTURE_CACHE_MS = 6 * 60 * 60 * 1000;     // 6h
-const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;       // 6h
+const FIXTURE_CACHE_MS = 6 * 60 * 60 * 1000;
+const MODEL_CACHE_MS = 6 * 60 * 60 * 1000;
 
 // ------------ UTIL ------------
 function pick(obj, keys, fallback = null) {
@@ -49,14 +44,10 @@ function pick(obj, keys, fallback = null) {
 
 function parseDateFlexible(v) {
   if (!v) return null;
-
-  // ISO, RFC, etc.
   const asDate = new Date(v);
   if (!isNaN(asDate.getTime())) return asDate;
 
   const s = String(v).trim();
-
-  // dd/mm/yyyy or dd/mm/yyyy hh:mm
   const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?$/);
   if (m) {
     const dd = Number(m[1]);
@@ -66,7 +57,6 @@ function parseDateFlexible(v) {
     const min = m[5] ? Number(m[5]) : 0;
     return new Date(Date.UTC(yyyy, mm, dd, hh, min, 0));
   }
-
   return null;
 }
 
@@ -83,15 +73,14 @@ function formatKickoffLocal(dateObj) {
 function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
 
 function poissonP(k, lam) {
-  // stable enough for k<=8
   let fact = 1;
-  for (let i=2;i<=k;i++) fact*=i;
+  for (let i=2;i<=k;i++) fact *= i;
   return Math.exp(-lam) * Math.pow(lam, k) / fact;
 }
 
 // ------------ FETCH + CACHE ------------
 let feedCache = { byUrl: new Map() };
-let modelCache = { ts: 0, model: null };
+let modelCache = { ts: 0, key: "", model: null };
 
 async function loadFeed(url) {
   const now = Date.now();
@@ -145,7 +134,7 @@ async function loadAllSeasonsUnified() {
   return all;
 }
 
-// ------------ MODEL (Poisson attack/defence with time-decay) ------------
+// ------------ MODEL ------------
 function buildModelFromMatches(matches, { halfLifeDays = 240, minGamesPerTeam = 6 } = {}) {
   const played = matches.filter(m => m.kickoffISO && m.hg != null && m.ag != null);
   const teamsSet = new Set();
@@ -156,10 +145,15 @@ function buildModelFromMatches(matches, { halfLifeDays = 240, minGamesPerTeam = 
   if (n === 0) return null;
 
   const games = new Array(n).fill(0);
+  let totalGoals = 0;
+  let totalMatches = 0;
   for (const m of played) {
     games[idx.get(m.home)]++;
     games[idx.get(m.away)]++;
+    totalGoals += (m.hg + m.ag);
+    totalMatches += 1;
   }
+  const leagueAvgGoals = totalMatches > 0 ? totalGoals / totalMatches : 2.8;
 
   let att = new Array(n).fill(0);
   let def = new Array(n).fill(0);
@@ -190,12 +184,8 @@ function buildModelFromMatches(matches, { halfLifeDays = 240, minGamesPerTeam = 
       const eA = (m.ag - muA) * w;
 
       gHa += eH;
-
-      gAtt[iH] += eH;
-      gDef[iA] += eH;
-
-      gAtt[iA] += eA;
-      gDef[iH] += eA;
+      gAtt[iH] += eH; gDef[iA] += eH;
+      gAtt[iA] += eA; gDef[iH] += eA;
     }
 
     for (let i=0;i<n;i++){
@@ -223,7 +213,7 @@ function buildModelFromMatches(matches, { halfLifeDays = 240, minGamesPerTeam = 
     teamMeta[teams[i]] = { games: games[i], att: att[i], def: def[i] };
   }
 
-  return { teams, idx, att, def, ha, halfLifeDays, minGamesPerTeam, teamMeta };
+  return { teams, idx, att, def, ha, halfLifeDays, minGamesPerTeam, teamMeta, leagueAvgGoals };
 }
 
 function matchProbs(model, home, away) {
@@ -265,8 +255,7 @@ function matchProbs(model, home, away) {
   const s = pH+pD+pA;
   if (s > 0){
     pH/=s; pD/=s; pA/=s;
-    pOver25/=s;
-    pOver35/=s;
+    pOver25/=s; pOver35/=s;
   }
 
   const okSample =
@@ -281,62 +270,33 @@ function synthOdds1x2(pH, pD, pA, margin = 0.055) {
   const sum = pH+pD+pA;
   if (sum <= 0) return { H: null, D: null, A: null };
   pH/=sum; pD/=sum; pA/=sum;
-
-  const qH = pH*(1+margin);
-  const qD = pD*(1+margin);
-  const qA = pA*(1+margin);
-
+  const qH = pH*(1+margin), qD = pD*(1+margin), qA = pA*(1+margin);
   return { H: 1/qH, D: 1/qD, A: 1/qA };
 }
 function synthOddsBinary(p, margin = 0.05) {
   const q = clamp(p*(1+margin), 0.02, 0.98);
   return 1 / q;
 }
-
-// ------------ SHAPE FOR UI ------------
-function toUiMatch(base, probs, oddsMode) {
-  const fixtureId = (base.kickoffISO || "") + "|" + base.home + "|" + base.away;
-
-  const p = probs.p1x2;
-  const probOver25 = probs.pOver25;
-  const probOver35 = probs.pOver35;
-
-  let odds1x2 = { H: null, D: null, A: null };
-  let oddsOver25 = null;
-  let oddsOver35 = null;
-
-  if (oddsMode === "synthetic") {
-    odds1x2 = synthOdds1x2(p.H, p.D, p.A, 0.055);
-    oddsOver25 = synthOddsBinary(probOver25, 0.05);
-    oddsOver35 = synthOddsBinary(probOver35, 0.05);
-  }
-
-  return {
-    fixtureId,
-    league: `A-LEAGUE (MEN)${base.round ? ` • Round ${base.round}` : ""}${base.location ? ` • ${base.location}` : ""}`,
-    kickoffLocal: base.kickoffLocal,
-    kickoffISO: base.kickoffISO,
-    home: base.home,
-    away: base.away,
-    model: { muH: probs.muH, muA: probs.muA, okSample: probs.okSample },
-    markets: {
-      "1x2": { probs: p, odds: odds1x2 },
-      "ou25": { line: 2.5, probOver: probOver25, oddsOver: oddsOver25 },
-      "ou35": { line: 3.5, probOver: probOver35, oddsOver: oddsOver35 }
-    }
-  };
+function profit1uBinary(win, odds) {
+  if (odds == null) return 0;
+  return win ? (odds - 1) * (1 - COMMISSION) : -1;
 }
+function logSafe(x){ return Math.log(clamp(x, 1e-12, 1-1e-12)); }
 
-// ------------ MODEL CACHE WRAPPER ------------
-async function getModel() {
+// model cache keyed by training seasons + params
+async function getModelFor(trainSeasonsKey, filterFn) {
   const now = Date.now();
-  if (modelCache.model && (now - modelCache.ts) < MODEL_CACHE_MS) return modelCache.model;
+  const key = trainSeasonsKey;
+  if (modelCache.model && modelCache.key === key && (now - modelCache.ts) < MODEL_CACHE_MS) return modelCache.model;
 
   const all = await loadAllSeasonsUnified();
-  const model = buildModelFromMatches(all, { halfLifeDays: 240, minGamesPerTeam: 6 });
-
-  modelCache = { ts: now, model };
+  const train = all.filter(filterFn);
+  const model = buildModelFromMatches(train, { halfLifeDays: 240, minGamesPerTeam: 6 });
+  modelCache = { ts: now, key, model };
   return model;
+}
+async function getDefaultModel() {
+  return getModelFor("default_all", _ => true);
 }
 
 // ------------ ROUTES ------------
@@ -371,9 +331,9 @@ app.get("/api/value", async (req, res) => {
     const minEv = clamp(Number(req.query.min_ev || 0), 0, 10);
     const minP = clamp(Number(req.query.min_p || 0), 0, 1);
     const minSample = String(req.query.min_sample || "1") === "1";
-    const oddsMode = String(req.query.odds || "synthetic"); // synthetic|live
+    const oddsMode = String(req.query.odds || "synthetic");
 
-    const model = await getModel();
+    const model = await getDefaultModel();
     const all = await loadAllSeasonsUnified();
     const latestSeason = all.filter(m => m.season === "2025/26");
 
@@ -387,22 +347,40 @@ app.get("/api/value", async (req, res) => {
 
     const ui = upcoming.map(m => {
       const probs = matchProbs(model, m.home, m.away);
-      return toUiMatch(m, probs, oddsMode);
+
+      const p = probs.p1x2;
+      const odds1x2 = synthOdds1x2(p.H, p.D, p.A, 0.055);
+      const oddsOver25 = synthOddsBinary(probs.pOver25, 0.05);
+      const oddsOver35 = synthOddsBinary(probs.pOver35, 0.05);
+
+      return {
+        fixtureId: (m.kickoffISO || "") + "|" + m.home + "|" + m.away,
+        league: `A-LEAGUE (MEN)${m.round ? ` • Round ${m.round}` : ""}${m.location ? ` • ${m.location}` : ""}`,
+        kickoffLocal: m.kickoffLocal,
+        kickoffISO: m.kickoffISO,
+        home: m.home,
+        away: m.away,
+        model: { muH: probs.muH, muA: probs.muA, okSample: probs.okSample },
+        markets: {
+          "1x2": { probs: p, odds: odds1x2 },
+          "ou25": { line: 2.5, probOver: probs.pOver25, oddsOver: oddsOver25 },
+          "ou35": { line: 3.5, probOver: probs.pOver35, oddsOver: oddsOver35 }
+        }
+      };
     });
 
     const filtered = ui.filter(m => {
       const ok = !minSample || (m.model?.okSample === true);
       if (!ok) return false;
-
       if (minEv <= 0 && minP <= 0) return true;
 
-      const cands = [];
       const p = m.markets["1x2"].probs;
       const o = m.markets["1x2"].odds;
-      cands.push({p:p.H,odds:o.H}); cands.push({p:p.D,odds:o.D}); cands.push({p:p.A,odds:o.A});
-      cands.push({p:m.markets["ou25"].probOver, odds:m.markets["ou25"].oddsOver});
-      cands.push({p:m.markets["ou35"].probOver, odds:m.markets["ou35"].oddsOver});
-
+      const cands = [
+        {p:p.H,odds:o.H},{p:p.D,odds:o.D},{p:p.A,odds:o.A},
+        {p:m.markets["ou25"].probOver, odds:m.markets["ou25"].oddsOver},
+        {p:m.markets["ou35"].probOver, odds:m.markets["ou35"].oddsOver}
+      ];
       const any = cands.some(x => x.p != null && x.odds != null && (x.p >= minP) && (x.p*(x.odds-1)*(1-COMMISSION) - (1-x.p) >= minEv));
       return any;
     });
@@ -411,11 +389,213 @@ app.get("/api/value", async (req, res) => {
       meta: {
         model: model ? `Poisson+TimeDecay (HL ${model.halfLifeDays}d)` : "neutral",
         odds: oddsMode === "synthetic" ? "synthetic" : "live (placeholder)",
+        leagueAvgGoals: model?.leagueAvgGoals || null,
         minGamesPerTeam: model?.minGamesPerTeam || 0
       },
       matches: filtered
     });
+  }catch(e){
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
 
+// Team stats panel
+app.get("/api/teams", async (req, res) => {
+  try{
+    const model = await getDefaultModel();
+    if (!model) return res.json({ meta:{}, teams:[] });
+
+    const teams = model.teams.map(t => {
+      const tm = model.teamMeta[t] || { games: 0, att: 0, def: 0 };
+      const attackRating = Math.exp(tm.att);      // >1 stronger attack
+      const defenseStrength = Math.exp(-tm.def);  // >1 stronger defence
+      const defenseLeak = Math.exp(tm.def);       // >1 concedes more
+      return { team: t, games: tm.games, att: tm.att, def: tm.def, attackRating, defenseStrength, defenseLeak };
+    });
+
+    teams.sort((a,b)=> (b.attackRating + b.defenseStrength) - (a.attackRating + a.defenseStrength));
+
+    res.json({
+      meta: {
+        model: `Poisson+TimeDecay (HL ${model.halfLifeDays}d)`,
+        minGamesPerTeam: model.minGamesPerTeam,
+        leagueAvgGoals: model.leagueAvgGoals
+      },
+      teams
+    });
+  }catch(e){
+    res.status(500).json({ error: e?.message || String(e) });
+  }
+});
+
+// Backtest: train on seasons before target season; test on target season played matches
+app.get("/api/backtest", async (req, res) => {
+  try{
+    const season = String(req.query.season || "2024/25");
+    const minEv = clamp(Number(req.query.min_ev || 0.02), 0, 10);
+    const minP = clamp(Number(req.query.min_p || 0.10), 0, 1);
+
+    const all = await loadAllSeasonsUnified();
+    const test = all.filter(m => m.season === season && m.kickoffISO && m.hg != null && m.ag != null);
+    if (test.length === 0) {
+      return res.json({ meta:{ season, note:"No played matches found for that season." }, summary:{}, calibration:{} });
+    }
+
+    const trainKey = `train_excluding_${season}`;
+    const model = await getModelFor(trainKey, m => m.season !== season);
+
+    let brier1x2 = 0, logloss1x2 = 0, n1x2 = 0, accTop = 0;
+    let brier25 = 0, logloss25 = 0, n25 = 0;
+    let brier35 = 0, logloss35 = 0, n35 = 0;
+
+    const roi = {
+      oneXtwo: { bets:0, wins:0, profit:0 },
+      ou25: { bets:0, wins:0, profit:0 },
+      ou35: { bets:0, wins:0, profit:0 },
+      combined: { bets:0, wins:0, profit:0 }
+    };
+
+    // Calibration bins
+    const makeBins = () => Array.from({length:10}, (_,i)=>({bin:i, n:0, pSum:0, ySum:0}));
+    const cal = { oneXtwoTop: makeBins(), ou25: makeBins(), ou35: makeBins() };
+
+    function addCal(bins, p, y){
+      const b = clamp(Math.floor(p*10), 0, 9);
+      bins[b].n += 1;
+      bins[b].pSum += p;
+      bins[b].ySum += y;
+    }
+
+    for (const m of test) {
+      const probs = matchProbs(model, m.home, m.away);
+      const p = probs.p1x2;
+
+      // observed 1X2
+      const yH = m.hg > m.ag ? 1 : 0;
+      const yD = m.hg === m.ag ? 1 : 0;
+      const yA = m.hg < m.ag ? 1 : 0;
+
+      brier1x2 += (p.H - yH)**2 + (p.D - yD)**2 + (p.A - yA)**2;
+      logloss1x2 += -(yH*logSafe(p.H) + yD*logSafe(p.D) + yA*logSafe(p.A));
+      n1x2 += 1;
+
+      // top pick accuracy + calibration
+      const top = [{k:"H",v:p.H},{k:"D",v:p.D},{k:"A",v:p.A}].sort((a,b)=>b.v-a.v)[0];
+      const topY = top.k==="H"?yH:top.k==="D"?yD:yA;
+      accTop += topY;
+      addCal(cal.oneXtwoTop, top.v, topY);
+
+      // totals observed
+      const tg = m.hg + m.ag;
+      const y25 = tg >= 3 ? 1 : 0;
+      const y35 = tg >= 4 ? 1 : 0;
+
+      brier25 += (probs.pOver25 - y25)**2;
+      logloss25 += -(y25*logSafe(probs.pOver25) + (1-y25)*logSafe(1-probs.pOver25));
+      n25 += 1;
+      addCal(cal.ou25, probs.pOver25, y25);
+
+      brier35 += (probs.pOver35 - y35)**2;
+      logloss35 += -(y35*logSafe(probs.pOver35) + (1-y35)*logSafe(1-probs.pOver35));
+      n35 += 1;
+      addCal(cal.ou35, probs.pOver35, y35);
+
+      // synthetic odds
+      const odds1x2 = synthOdds1x2(p.H, p.D, p.A, 0.055);
+      const oddsO25 = synthOddsBinary(probs.pOver25, 0.05);
+      const oddsO35 = synthOddsBinary(probs.pOver35, 0.05);
+
+      // 1X2: bet top outcome if +EV & p>=minP
+      const topOdds = top.k==="H"?odds1x2.H:top.k==="D"?odds1x2.D:odds1x2.A;
+      const topP = top.v;
+      const topEV = topP*(topOdds-1)*(1-COMMISSION) - (1-topP);
+      if (topOdds != null && topP >= minP && topEV >= minEv) {
+        roi.oneXtwo.bets += 1; roi.combined.bets += 1;
+        if (topY === 1) { roi.oneXtwo.wins += 1; roi.combined.wins += 1; }
+        const pr = profit1uBinary(topY===1, topOdds);
+        roi.oneXtwo.profit += pr; roi.combined.profit += pr;
+      }
+
+      // O2.5
+      const ev25 = probs.pOver25*(oddsO25-1)*(1-COMMISSION) - (1-probs.pOver25);
+      if (oddsO25 != null && probs.pOver25 >= minP && ev25 >= minEv) {
+        roi.ou25.bets += 1; roi.combined.bets += 1;
+        if (y25 === 1) { roi.ou25.wins += 1; roi.combined.wins += 1; }
+        const pr = profit1uBinary(y25===1, oddsO25);
+        roi.ou25.profit += pr; roi.combined.profit += pr;
+      }
+
+      // O3.5
+      const ev35 = probs.pOver35*(oddsO35-1)*(1-COMMISSION) - (1-probs.pOver35);
+      if (oddsO35 != null && probs.pOver35 >= minP && ev35 >= minEv) {
+        roi.ou35.bets += 1; roi.combined.bets += 1;
+        if (y35 === 1) { roi.ou35.wins += 1; roi.combined.wins += 1; }
+        const pr = profit1uBinary(y35===1, oddsO35);
+        roi.ou35.profit += pr; roi.combined.profit += pr;
+      }
+    }
+
+    function finalizeBins(bins){
+      return bins.map(b => ({
+        bin: b.bin,
+        n: b.n,
+        pAvg: b.n ? b.pSum/b.n : null,
+        yAvg: b.n ? b.ySum/b.n : null
+      }));
+    }
+
+    res.json({
+      meta: {
+        season,
+        trainedOn: SEASON_FEEDS.map(x=>x.season).filter(s=>s!==season),
+        model: model ? `Poisson+TimeDecay (HL ${model.halfLifeDays}d)` : "neutral",
+        odds: "synthetic",
+        thresholds: { minEv, minP }
+      },
+      summary: {
+        matches: test.length,
+        oneXtwo: {
+          topPickAcc: n1x2 ? accTop/n1x2 : null,
+          brier: n1x2 ? brier1x2/n1x2 : null,
+          logloss: n1x2 ? logloss1x2/n1x2 : null
+        },
+        ou25: {
+          brier: n25 ? brier25/n25 : null,
+          logloss: n25 ? logloss25/n25 : null
+        },
+        ou35: {
+          brier: n35 ? brier35/n35 : null,
+          logloss: n35 ? logloss35/n35 : null
+        },
+        roi: {
+          oneXtwo: {
+            ...roi.oneXtwo,
+            roi: roi.oneXtwo.bets ? roi.oneXtwo.profit/roi.oneXtwo.bets : null,
+            winRate: roi.oneXtwo.bets ? roi.oneXtwo.wins/roi.oneXtwo.bets : null
+          },
+          ou25: {
+            ...roi.ou25,
+            roi: roi.ou25.bets ? roi.ou25.profit/roi.ou25.bets : null,
+            winRate: roi.ou25.bets ? roi.ou25.wins/roi.ou25.bets : null
+          },
+          ou35: {
+            ...roi.ou35,
+            roi: roi.ou35.bets ? roi.ou35.profit/roi.ou35.bets : null,
+            winRate: roi.ou35.bets ? roi.ou35.wins/roi.ou35.bets : null
+          },
+          combined: {
+            ...roi.combined,
+            roi: roi.combined.bets ? roi.combined.profit/roi.combined.bets : null,
+            winRate: roi.combined.bets ? roi.combined.wins/roi.combined.bets : null
+          }
+        }
+      },
+      calibration: {
+        oneXtwoTop: finalizeBins(cal.oneXtwoTop),
+        ou25: finalizeBins(cal.ou25),
+        ou35: finalizeBins(cal.ou35)
+      }
+    });
   }catch(e){
     res.status(500).json({ error: e?.message || String(e) });
   }
