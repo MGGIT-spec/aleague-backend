@@ -1,16 +1,14 @@
-// A-League backend v3 (FULL FILE)
+// A-League backend v3 (FULL FILE) — FIXED RESULT PARSING
 // Adds:
-//  - /api/teams     (attack/defence ratings + games played)
-//  - /api/seasons   (shows total + played match counts per season)
-//  - /api/backtest  (model validation: ROI, hit rate, calibration, brier/logloss)
-//      * supports season=auto (picks latest season with played matches)
-//
-// Still supports:
-//  - /health
+//  - /api/teams
+//  - /api/seasons
+//  - /api/backtest (season=auto supported)
 //  - /api/fixtures
 //  - /api/value
 //
-// No Betfair required (synthetic odds).
+// IMPORTANT FIX:
+//  FixtureDownload sometimes uses en-dash/em-dash in Result ("2 – 1" or "2 — 1").
+//  parseScore now accepts - – — : to correctly detect played matches.
 
 const express = require("express");
 const cors = require("cors");
@@ -104,10 +102,19 @@ async function loadFeed(url) {
   return rows;
 }
 
+// ✅ FIXED: accept hyphen-minus, en-dash, em-dash, and colon.
+// Also ignore "-" / "–" / "—" placeholders.
 function parseScore(resultStr) {
   if (!resultStr) return null;
-  const m = String(resultStr).match(/(\d+)\s*-\s*(\d+)/);
+  const s = String(resultStr).trim();
+
+  // common placeholders for not-played-yet
+  if (s === "-" || s === "–" || s === "—") return null;
+
+  // Match: "2 - 1", "2–1", "2 — 1", "2:1"
+  const m = s.match(/(\d+)\s*[-–—:]\s*(\d+)/);
   if (!m) return null;
+
   return { hg: Number(m[1]), ag: Number(m[2]) };
 }
 
@@ -118,6 +125,8 @@ function rowToUnified(row, seasonLabel) {
   const round = pick(row, ["Round Number", "RoundNumber", "round", "matchday"], "");
   const rawDate = pick(row, ["Date", "date", "Kickoff", "kickoff", "Start", "start_time"], null);
   const dt = parseDateFlexible(rawDate);
+
+  // Result key variants
   const res = parseScore(pick(row, ["Result", "result", "Score", "score"], null));
 
   return {
@@ -163,7 +172,6 @@ function pickAutoBacktestSeason(counts) {
 
   if (candidates.length === 0) return null;
 
-  // prefer later season labels first; tie-break by played count
   candidates.sort((a, b) => {
     if (a.s < b.s) return 1;
     if (a.s > b.s) return -1;
@@ -233,7 +241,6 @@ function buildModelFromMatches(matches, { halfLifeDays = 240, minGamesPerTeam = 
     }
     ha += lr * gHa;
 
-    // identifiability: zero-mean constraints
     const meanAtt = att.reduce((a, b) => a + b, 0) / n;
     const meanDef = def.reduce((a, b) => a + b, 0) / n;
     for (let i = 0; i < n; i++) {
@@ -344,7 +351,6 @@ async function getDefaultModel() {
 // ------------ ROUTES ------------
 app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// NEW: season counts
 app.get("/api/seasons", async (req, res) => {
   try {
     const all = await loadAllSeasonsUnified();
@@ -409,7 +415,6 @@ app.get("/api/value", async (req, res) => {
       const probs = matchProbs(model, m.home, m.away);
       const p = probs.p1x2;
 
-      // synthetic odds only for now
       const odds1x2 = synthOdds1x2(p.H, p.D, p.A, 0.055);
       const oddsOver25 = synthOddsBinary(probs.pOver25, 0.05);
       const oddsOver35 = synthOddsBinary(probs.pOver35, 0.05);
@@ -466,7 +471,6 @@ app.get("/api/value", async (req, res) => {
   }
 });
 
-// Team stats panel
 app.get("/api/teams", async (req, res) => {
   try {
     const model = await getDefaultModel();
@@ -474,9 +478,9 @@ app.get("/api/teams", async (req, res) => {
 
     const teams = model.teams.map(t => {
       const tm = model.teamMeta[t] || { games: 0, att: 0, def: 0 };
-      const attackRating = Math.exp(tm.att);      // >1 stronger attack
-      const defenseStrength = Math.exp(-tm.def);  // >1 stronger defence
-      const defenseLeak = Math.exp(tm.def);       // >1 concedes more
+      const attackRating = Math.exp(tm.att);
+      const defenseStrength = Math.exp(-tm.def);
+      const defenseLeak = Math.exp(tm.def);
       return { team: t, games: tm.games, att: tm.att, def: tm.def, attackRating, defenseStrength, defenseLeak };
     });
 
@@ -495,7 +499,6 @@ app.get("/api/teams", async (req, res) => {
   }
 });
 
-// Backtest: season can be explicit like 2024/25 OR season=auto
 app.get("/api/backtest", async (req, res) => {
   try {
     let season = String(req.query.season || "auto");
@@ -531,13 +534,10 @@ app.get("/api/backtest", async (req, res) => {
     const trainKey = `train_excluding_${season}`;
     const model = await getModelFor(trainKey, m => m.season !== season);
 
-    // 1X2 metrics
     let brier1x2 = 0, logloss1x2 = 0, n1x2 = 0, accTop = 0;
-    // totals metrics
     let brier25 = 0, logloss25 = 0, n25 = 0;
     let brier35 = 0, logloss35 = 0, n35 = 0;
 
-    // ROI simulation
     const roi = {
       oneXtwo: { bets: 0, wins: 0, profit: 0 },
       ou25: { bets: 0, wins: 0, profit: 0 },
@@ -545,7 +545,6 @@ app.get("/api/backtest", async (req, res) => {
       combined: { bets: 0, wins: 0, profit: 0 }
     };
 
-    // calibration bins
     const makeBins = () => Array.from({ length: 10 }, (_, i) => ({ bin: i, n: 0, pSum: 0, ySum: 0 }));
     const cal = { oneXtwoTop: makeBins(), ou25: makeBins(), ou35: makeBins() };
 
@@ -556,11 +555,26 @@ app.get("/api/backtest", async (req, res) => {
       bins[b].ySum += y;
     }
 
+    function synthOdds1x2(pH, pD, pA, margin = 0.055) {
+      const sum = pH + pD + pA;
+      if (sum <= 0) return { H: null, D: null, A: null };
+      pH /= sum; pD /= sum; pA /= sum;
+      const qH = pH * (1 + margin), qD = pD * (1 + margin), qA = pA * (1 + margin);
+      return { H: 1 / qH, D: 1 / qD, A: 1 / qA };
+    }
+    function synthOddsBinary(p, margin = 0.05) {
+      const q = clamp(p * (1 + margin), 0.02, 0.98);
+      return 1 / q;
+    }
+    function profit1uBinary(win, odds) {
+      if (odds == null) return 0;
+      return win ? (odds - 1) * (1 - COMMISSION) : -1;
+    }
+
     for (const m of test) {
       const probs = matchProbs(model, m.home, m.away);
       const p = probs.p1x2;
 
-      // observed 1X2
       const yH = m.hg > m.ag ? 1 : 0;
       const yD = m.hg === m.ag ? 1 : 0;
       const yA = m.hg < m.ag ? 1 : 0;
@@ -569,13 +583,11 @@ app.get("/api/backtest", async (req, res) => {
       logloss1x2 += -(yH * logSafe(p.H) + yD * logSafe(p.D) + yA * logSafe(p.A));
       n1x2 += 1;
 
-      // top pick
       const top = [{ k: "H", v: p.H }, { k: "D", v: p.D }, { k: "A", v: p.A }].sort((a, b) => b.v - a.v)[0];
       const topY = top.k === "H" ? yH : top.k === "D" ? yD : yA;
       accTop += topY;
       addCal(cal.oneXtwoTop, top.v, topY);
 
-      // totals observed
       const tg = m.hg + m.ag;
       const y25 = tg >= 3 ? 1 : 0;
       const y35 = tg >= 4 ? 1 : 0;
@@ -590,12 +602,10 @@ app.get("/api/backtest", async (req, res) => {
       n35 += 1;
       addCal(cal.ou35, probs.pOver35, y35);
 
-      // synthetic odds
       const odds1x2 = synthOdds1x2(p.H, p.D, p.A, 0.055);
       const oddsO25 = synthOddsBinary(probs.pOver25, 0.05);
       const oddsO35 = synthOddsBinary(probs.pOver35, 0.05);
 
-      // 1X2: bet top outcome if +EV & p>=minP
       const topOdds = top.k === "H" ? odds1x2.H : top.k === "D" ? odds1x2.D : odds1x2.A;
       const topP = top.v;
       const topEV = topP * (topOdds - 1) * (1 - COMMISSION) - (1 - topP);
@@ -606,7 +616,6 @@ app.get("/api/backtest", async (req, res) => {
         roi.oneXtwo.profit += pr; roi.combined.profit += pr;
       }
 
-      // O2.5
       const ev25 = probs.pOver25 * (oddsO25 - 1) * (1 - COMMISSION) - (1 - probs.pOver25);
       if (oddsO25 != null && probs.pOver25 >= minP && ev25 >= minEv) {
         roi.ou25.bets += 1; roi.combined.bets += 1;
@@ -615,7 +624,6 @@ app.get("/api/backtest", async (req, res) => {
         roi.ou25.profit += pr; roi.combined.profit += pr;
       }
 
-      // O3.5
       const ev35 = probs.pOver35 * (oddsO35 - 1) * (1 - COMMISSION) - (1 - probs.pOver35);
       if (oddsO35 != null && probs.pOver35 >= minP && ev35 >= minEv) {
         roi.ou35.bets += 1; roi.combined.bets += 1;
@@ -656,28 +664,6 @@ app.get("/api/backtest", async (req, res) => {
         ou35: {
           brier: n35 ? brier35 / n35 : null,
           logloss: n35 ? logloss35 / n35 : null
-        },
-        roi: {
-          oneXtwo: {
-            ...roi.oneXtwo,
-            roi: roi.oneXtwo.bets ? roi.oneXtwo.profit / roi.oneXtwo.bets : null,
-            winRate: roi.oneXtwo.bets ? roi.oneXtwo.wins / roi.oneXtwo.bets : null
-          },
-          ou25: {
-            ...roi.ou25,
-            roi: roi.ou25.bets ? roi.ou25.profit / roi.ou25.bets : null,
-            winRate: roi.ou25.bets ? roi.ou25.wins / roi.ou25.bets : null
-          },
-          ou35: {
-            ...roi.ou35,
-            roi: roi.ou35.bets ? roi.ou35.profit / roi.ou35.bets : null,
-            winRate: roi.ou35.bets ? roi.ou35.wins / roi.ou35.bets : null
-          },
-          combined: {
-            ...roi.combined,
-            roi: roi.combined.bets ? roi.combined.profit / roi.combined.bets : null,
-            winRate: roi.combined.bets ? roi.combined.wins / roi.combined.bets : null
-          }
         }
       },
       calibration: {
